@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     response::{Sse, sse::Event},
     routing::{get, post},
 };
@@ -13,18 +13,29 @@ use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Clone)]
 struct AppState {
-    tx: broadcast::Sender<BroadcastMessage>,
-    topics: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    topics: Arc<Mutex<HashMap<String, broadcast::Sender<BroadcastMessage>>>>,
 }
 
 async fn sse_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.tx.subscribe();
+    let topic_id = params.get("topic_id").cloned().unwrap_or_default();
+    let tx = {
+        let mut topics = state.topics.lock().await;
+        topics
+            .entry(topic_id)
+            .or_insert_with(|| broadcast::channel::<BroadcastMessage>(100).0)
+            .clone()
+    };
+
+    let rx = tx.subscribe();
+
     let stream = BroadcastStream::new(rx).map(|msg| match msg {
         Ok(text) => Ok(Event::default().data(text.message)),
         Err(_) => Ok(Event::default().data("<error>")),
     });
+
     Sse::new(stream)
 }
 
@@ -34,44 +45,25 @@ struct BroadcastMessage {
     topic: String,
 }
 
-#[derive(Deserialize)]
-struct SubscribeRequest {
-    client_id: String,
-    topic: String,
-}
-
 async fn broadcast_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BroadcastMessage>,
 ) {
-    let _ = state.tx.send(payload);
-}
-
-async fn subscribe_handler(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<SubscribeRequest>,
-) {
-    state
-        .topics
-        .lock()
-        .await
-        .entry(payload.client_id)
-        .or_default()
-        .insert(payload.topic, "subscribed".to_string());
+    let topics = state.topics.lock().await;
+    if let Some(tx) = topics.get(&payload.topic) {
+        let _ = tx.send(payload);
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let (tx, _) = broadcast::channel::<BroadcastMessage>(100);
     let state = Arc::new(AppState {
-        tx,
         topics: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let app = Router::new()
         .route("/sse", get(sse_handler))
         .route("/broadcast", post(broadcast_handler))
-        .route("/subscribe", post(subscribe_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
