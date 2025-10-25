@@ -10,6 +10,8 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
+use tower::ServiceBuilder;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 struct AppState {
@@ -61,11 +63,17 @@ async fn main() {
         topics: Arc::new(Mutex::new(HashMap::new())),
     });
 
-    let app = Router::new()
+    let cors_layer = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let router = Router::new()
         .route("/sse", get(sse_handler))
         .route("/broadcast", post(broadcast_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(ServiceBuilder::new().layer(cors_layer));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, router).await.unwrap();
 }
